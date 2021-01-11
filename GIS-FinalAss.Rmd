@@ -1,0 +1,456 @@
+---
+title: "GIS-FINAL"
+output: html_document
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#Part 1：Aggregate and clean data
+
+##1.1 Ward boundary
+```{r}
+#library a bunch of packages first
+library(tidyverse)
+library(tmap)
+library(geojsonio)
+library(plotly)
+library(rgdal)
+library(broom)
+library(mapview)
+library(crosstalk)
+library(sf)
+library(sp)
+library(spdep)
+library(car)
+library(fs)
+library(janitor)
+library(dplyr)
+library(fs)
+library(here)
+library(stringr)
+library(utils)
+library(highcharter)
+library(downloader)
+library(rgdal)
+library(ggplot2)
+library(reshape2)
+library(plotly)
+library(raster)
+library(grid)
+library(Rmisc)
+library(janitor)
+#download a zip file containing some boundaries
+
+download.file("https://data.london.gov.uk/download/statistical-gis-boundary-files-london/9ba8c833-6370-4b11-abdc-314aa020d5e0/statistical-gis-boundaries-london.zip", destfile="data/statistical-gis-boundaries-london.zip")
+#if download not work well, please download manually
+
+#Get the zip file and extract it
+listfiles<-dir_info(here::here("data")) %>%
+  dplyr::filter(str_detect(path, ".zip")) %>%
+  dplyr::select(path)%>%
+  pull()%>%
+  #print out the .gz file
+  print()%>%
+  as.character()%>%
+  utils::unzip(exdir=here::here("data"))
+#look what is inside the zip
+Londonwards<-dir_info(here::here("data", 
+                                 "statistical-gis-boundaries-london", 
+                                 "ESRI"))%>%
+  #$ means exact match
+  dplyr::filter(str_detect(path, 
+                           "London_Ward_CityMerged.shp$"))%>%
+  dplyr::select(path)%>%
+  pull()%>%
+  #read in the file in
+  st_read()
+  
+```
+
+
+##1.2 Get the median price of short-term leases (less than 90 days) from Inside airbnb**
+                              
+```{r setup, results='hide'}
+#use the  September data
+InsideAirbnb <- read_csv("http://data.insideairbnb.com/united-kingdom/england/london/2015-09-02/visualisations/listings.csv")
+#from the coordinate values stored in the x and y columns, which look like they are latitude and longitude values, create a new points dataset
+InsideAirbnb_sf <- st_as_sf(InsideAirbnb, 
+                           coords = c("longitude","latitude"), 
+                           crs = 4326)
+# get the rent price(<90 days)
+rent_price90 <- InsideAirbnb_sf  %>%
+  filter(availability_365<=90) %>%
+  dplyr::select("price", "availability_365","geometry") 
+
+# transform to the same crs and join data with Londonwards
+rent_price90<- st_transform(rent_price90, 27700)  
+Londonwards<- st_transform(Londonwards, 27700)
+
+merge_price <- sf::st_join(rent_price90,Londonwards["GSS_CODE"])
+
+#get the mean_price by ward level
+median_price <- merge_price   %>% 
+  group_by(GSS_CODE)%>%
+  summarise(mean_price=median(price))
+mean_price<- merge_price   %>% group_by(GSS_CODE)%>%
+  summarise(mean_price=mean(price))
+``` 
+
+It shows that some wards don't have data, so I decide to add the April's Airbnb to the September's data.Because they're 90 days apart, there's no overlap in theory.
+
+``` {r setup, results='hide'}
+##it airbnb September data plus April data, "2015-listings.csv" is the sum 
+InsideAirbnb3 <- read_csv("https://github.com/zczlq11/GIS-Finalwork-2021/blob/main/data/2015-listings.csv?raw=TRUE")
+InsideAirbnb3_sf <- st_as_sf(InsideAirbnb3, 
+                           coords = c("longitude","latitude"), 
+                           crs = 4326) %>%
+                           st_transform(., 27700)  
+# get the rent price(<90 days)
+rent_price90_3 <- InsideAirbnb3_sf  %>%
+  filter(availability_365<=90) %>%
+  dplyr::select("price", "availability_365","geometry") 
+
+merge_price3 <- sf::st_join(rent_price90_3,Londonwards["GSS_CODE"])
+
+#get the mean_price by ward level
+median_price3 <- merge_price3   %>% group_by(GSS_CODE)%>%
+  summarise(median_price=median(price))
+
+```                              
+  
+                                          
+##1.3 Aggregate independent variable data
+```{r setup, results='hide'}
+crime <-read.csv("https://github.com/zczlq11/GIS-Finalwork-2021/blob/main/data/MPS_Ward_Level_Crime_Historic_NewWardfinal.csv?raw=TRUE", 
+               header = TRUE, sep = ",", encoding = "latin1")
+
+accessibility<-read.csv("https://github.com/zczlq11/GIS-Finalwork-2021/blob/main/data/Ward2011%20AvPTAI2015.csv?raw=TRUE", 
+             header = TRUE, sep = ",", encoding = "latin1")
+
+wardprofile2015<-read.csv("https://github.com/zczlq11/GIS-Finalwork-2021/blob/main/data/ward-profiles-excel-version.csv?raw=TRUE", 
+                                               header = TRUE, sep = ",", encoding = "latin1")
+variables <- crime %>%  
+  left_join(., 
+            accessibility,
+            by = c("WardCode" = "WardCode"))
+variables<- variables %>%  
+  left_join(., 
+            wardprofile2015,
+            by = c("WardCode" = "WardCode"))
+variables<- variables %>%  
+  clean_names() 
+
+#create a new csv
+write.table(variables,"variables.csv",row.names=FALSE,col.names=TRUE,sep=",")
+```
+
+##1.4 merge boundaries and variables
+```{r setup, results='hide'}
+#londonward with indenpent variables
+LonWard_variables <- Londonwards%>%
+  left_join(.,
+            variables, 
+            by = c("GSS_CODE" = "ward_code"))
+  
+#with airbnb data         
+ LonWard_variables <-sf::st_join(LonWard_variables,median_price3["median_price"])      
+
+```
+
+##1.5 mapping the dependent variable 
+```{r}
+tmap_mode("plot")
+qtm(LonWard_variables, 
+    fill = "median_price", 
+    borders = NULL,  
+    fill.palette = "Blues")+
+  tm_scale_bar(position = c("left", "bottom"))+
+  tm_compass(position = c("right", "top"),type = "arrow") 
+
+  
+```
+   
+   
+#Part 2：OLS Regression
+   
+##2.1 descriptive statistics
+```{r}
+#Clean the dataset
+LonWard_variables <- LonWard_variables  %>%
+  dplyr::select("ward_name","GSS_CODE" ,"geometry","median_price","crime2015", "av_ptai2015", "house_price_gap","claimant_rate_of_housing_benefit_2015") 
+
+#check the distribution of these variables first
+
+p1<-ggplot(LonWard_variables, aes(x=median_price)) + 
+  geom_histogram(aes(y = ..density..),
+                 binwidth = 5) + 
+  geom_density(colour="red", 
+               size=1, 
+               adjust=1)
+p2<-ggplot(LonWard_variables, aes(x=crime2015)) + 
+  geom_histogram(aes(y = ..density..),
+                 binwidth = 5) + 
+  geom_density(colour="red", 
+               size=1, 
+               adjust=1)
+p3<-ggplot(LonWard_variables, aes(x=av_ptai2015)) + 
+  geom_histogram(aes(y = ..density..),
+                 binwidth = 5) + 
+  geom_density(colour="red", 
+               size=1, 
+               adjust=1)
+p4<-ggplot(LonWard_variables, aes(x=house_price_gap)) + 
+  geom_histogram(aes(y = ..density..),
+                 binwidth = 5) + 
+  geom_density(colour="red", 
+               size=1, 
+               adjust=1)
+p5<-ggplot(LonWard_variables, aes(x=claimant_rate_of_housing_benefit_2015)) + 
+  geom_histogram(aes(y = ..density..),
+                 binwidth = 5) + 
+  geom_density(colour="red", 
+               size=1, 
+               adjust=1)
+multiplot(p1, p2, p3, p4,p5,cols=2)
+```
+
+```{r}
+#tranformation----house_price_gap
+symbox(~house_price_gap, 
+       LonWard_variables, 
+       na.rm=T,
+       powers=seq(-3,3,by=.5))
+```
+```{r}
+ggplot(LonWard_variables, aes(x=(house_price_gap)^0.5)) + 
+  geom_histogram()
+```
+   
+##2.2 Simple linear regression
+```{r}
+LonWard_variables_dropna<-na.omit(LonWard_variables)
+Regressiondata<- LonWard_variables_dropna%>%
+  dplyr::select(median_price, 
+                crime2015)
+model1 <- Regressiondata %>%
+  lm(median_price ~
+               crime2015,
+     data=.)
+
+#av_ptai2015
+Regressiondata2<- LonWard_variables_dropna%>%
+  dplyr::select(median_price, 
+                av_ptai2015)
+model2 <- Regressiondata2 %>%
+  lm(median_price ~
+               av_ptai2015,
+     data=.)
+
+#house_price_gap
+LonWard_variables_dropna<-LonWard_variables_dropna%>%
+  mutate(house_price_gap_transform= ((house_price_gap)^0.5))
+         
+Regressiondata3<- LonWard_variables_dropna%>%
+  dplyr::select(median_price, 
+                house_price_gap_transform)
+model3 <- Regressiondata3 %>%
+  lm(median_price ~
+               house_price_gap_transform,
+     data=.)
+
+
+Regressiondata4<- LonWard_variables_dropna%>%
+  dplyr::select(median_price, 
+                claimant_rate_of_housing_benefit_2015)
+model4 <- Regressiondata4 %>%
+  lm(median_price ~
+               claimant_rate_of_housing_benefit_2015,
+     data=.)
+summary(model1)
+summary(model2)
+summary(model3)
+summary(model4)
+```
+It is obvious that there is no correlation in house_price_gap and crime with short-term rental prices. So we focus on av_ptai2015 and claimant_rate_of_housing_benefit_2015, and check the residuals to see  if it meets the linear regression conditions.
+
+```{r}
+
+model_data2 <- model2 %>%
+  augment(., Regressiondata2)
+
+model_data4 <- model4 %>%
+  augment(., Regressiondata4)
+#plot residuals
+p1 <-model_data2%>%
+dplyr::select(.resid)%>%
+  pull()%>%
+  qplot()+ 
+geom_histogram(aes(y = ..density..),
+                 binwidth = 5)  
+  
+
+p2 <-model_data4%>%
+dplyr::select(.resid)%>%
+  pull()%>%
+  qplot()+ 
+geom_histogram(aes(y = ..density..),
+                 binwidth = 5)   
+
+multiplot(p1, p2,cols=2)
+```
+
+##2.2 multiple linear regression
+```{r}
+multipleRegression<- LonWard_variables_dropna%>%
+  clean_names()%>%
+  dplyr::select(median_price,
+         av_ptai2015,
+         claimant_rate_of_housing_benefit_2015)
+
+multiplemodel <- lm(median_price ~ av_ptai2015 + 
+               claimant_rate_of_housing_benefit_2015, data = multipleRegression)
+
+#show the summary of those outputs
+tidy(multiplemodel)
+glance(multiplemodel)
+```
+
+check VIF and residual
+```{r}
+vif(multiplemodel)
+
+multiplemodel_data <- multiplemodel %>%
+  augment(., multipleRegression)
+
+# also add them to the shapelayer
+LonWard_variables_dropna <- LonWard_variables_dropna %>%
+  mutate(multipleRegressionresids = residuals(multiplemodel))
+
+#print some model diagnositcs. 
+par(mfrow=c(2,2))    #plot to 2 by 2 array
+plot(multiplemodel)
+```
+
+##2.3 Autocorrelation
+```{r}
+DW <- durbinWatsonTest(multiplemodel)
+tidy(DW)
+```
+```{r}
+#now plot the residuals
+tmap_mode("plot")
+#qtm(LonWardProfiles, fill = "model1_resids")
+
+tm_shape(LonWard_variables_dropna) +
+  tm_polygons("multipleRegressionresids",
+              palette = "RdYlBu") +
+  tm_scale_bar(position = c("left", "bottom"))+
+  tm_compass(position = c("right", "bottom"),type = "arrow") 
+
+  #par(new = TRUE)
+ # tm_shape(Londonwards)
+```
+Moran's I
+```{r}
+#calculate the centroids of all Wards in London
+coordsW <- LonWard_variables_dropna%>%
+  st_centroid()%>%
+  st_geometry()
+
+# generate a spatial weights matrix. We'll start with a simple binary matrix of queen's case neighbours
+
+LWard_nb <- LonWard_variables_dropna %>%
+  poly2nb(., queen=T)
+
+#or nearest neighbours
+knn_wards <-coordsW %>%
+  knearneigh(., k=4)
+
+LWard_knn <- knn_wards %>%
+  knn2nb()
+
+#create a spatial weights matrix object from these weights
+Lward.queens_weight <- LWard_nb %>%
+   #if no-neighbour observations were present and the zero.policy argument set to true.
+  nb2listw(.,style="C",zero.policy=TRUE)
+
+Lward.knn_4_weight <- LWard_knn %>%
+  nb2listw(.,style="C",zero.policy=TRUE)
+
+Queen <- LonWard_variables_dropna %>%
+  st_drop_geometry()%>%
+  dplyr::select(multipleRegressionresids)%>%
+  pull()%>%
+  moran.test(., Lward.queens_weight,zero.policy=TRUE)%>%
+  tidy()
+
+Nearest_neighbour <-  LonWard_variables_dropna %>%
+  st_drop_geometry()%>%
+  dplyr::select(multipleRegressionresids)%>%
+  pull()%>%
+  moran.test(., Lward.knn_4_weight,zero.policy=TRUE)%>%
+  tidy()
+
+Queen
+```
+
+```{r}
+Nearest_neighbour
+```
+
+##2.4 GWR 
+```{r}
+library(spgwr)
+st_crs(LonWard_variables_dropna) = 27700
+LonWard_variablesSP <- LonWard_variables_dropna %>%
+  as(., "Spatial")
+
+st_crs(coordsW) = 27700
+coordsWSP <- coordsW %>%
+  as(., "Spatial")
+
+#calculate kernel bandwidth
+GWRbandwidth <- gwr.sel(median_price ~ av_ptai2015 + 
+               claimant_rate_of_housing_benefit_2015, 
+                  data = LonWard_variablesSP, 
+                        coords=coordsWSP,
+                        adapt=T)
+#run the gwr model
+gwr.model = gwr(median_price ~ av_ptai2015 + 
+               claimant_rate_of_housing_benefit_2015, 
+                  data = LonWard_variablesSP, 
+                coords=coordsWSP, 
+                adapt=GWRbandwidth, 
+                hatmatrix=TRUE, 
+                se.fit=TRUE)
+
+results <- as.data.frame(gwr.model$SDF)
+names(results)
+
+#attach coefficients to original SF
+LonWardProfiles2 <- LonWard_variables_dropna %>%
+  mutate(coefAccessibility = results$av_ptai2015,
+         coefBenefit = results$claimant_rate_of_housing_benefit_2015)
+#mapping
+tmap_mode("plot")
+tm_shape(LonWardProfiles2) +
+  tm_polygons(col = "coefAccessibility", 
+              palette = "RdBu", 
+              alpha = 0.5)+
+    tm_scale_bar(position = c("left", "bottom"))+
+  tm_compass(position = c("right", "bottom"),type = "arrow") 
+```
+
+
+```{r}
+tmap_mode("plot")
+tm_shape(LonWardProfiles2) +
+  tm_polygons(col = "coefBenefit", 
+              palette = "RdBu", 
+              alpha = 0.5)+ 
+    tm_scale_bar(position = c("left", "bottom"))+
+  tm_compass(position = c("right", "bottom"),type = "arrow") 
+```
+
+
